@@ -285,7 +285,7 @@ if time_slider and df["timestamp"].notna().any():
         auto_play=False
     ).add_to(m)
 
-st_folium(m, height=640, returned_objects=[])
+st_folium(m, width=1350, height=800, returned_objects=[])
 
 with st.expander("Первые строки очищенных данных"):
     st.dataframe(df.head(50))
