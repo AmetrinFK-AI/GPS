@@ -141,27 +141,102 @@ def preprocess_track(df: pd.DataFrame) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
-def compute_metrics(df: pd.DataFrame):
+def _format_hms(hours: float) -> str:
+    if not isinstance(hours, (int, float)) or not np.isfinite(hours):
+        return "—"
+    total_seconds = int(round(hours * 3600))
+    h = total_seconds // 3600
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+def compute_metrics(df: pd.DataFrame, prefer_source: str = "auto"):
+    """
+    Расчитывает:
+      - seg_dist_km, seg_dt_h, speed_kmh
+      - cum_km
+      - total_km, duration_h, avg_speed_kmh, max_speed_kmh
+    Источник расстояния:
+      auto: по одометру, если есть адекватные данные, иначе GPS
+      gps: только haversine
+      odo: только одометр (с авто-масштабом м→км по медиане)
+    """
     n = len(df)
-    seg_dist_km = np.zeros(n); seg_dt_h = np.zeros(n)
+    seg_dt_h = np.zeros(n)
+    # время сегмента
     for i in range(1, n):
-        seg_dist_km[i] = haversine_km(df.at[i-1,"lat"], df.at[i-1,"lon"], df.at[i,"lat"], df.at[i,"lon"])
-        t1, t2 = df.at[i-1,"timestamp"], df.at[i,"timestamp"]
+        t1, t2 = df.at[i-1, "timestamp"], df.at[i, "timestamp"]
         if pd.notna(t1) and pd.notna(t2):
             seg_dt_h[i] = max((t2 - t1).total_seconds(), 0) / 3600.0
+
+    # GPS расстояния
+    gps_dist = np.zeros(n)
+    for i in range(1, n):
+        gps_dist[i] = haversine_km(df.at[i-1,"lat"], df.at[i-1,"lon"], df.at[i,"lat"], df.at[i,"lon"])
+
+    # Одометрические расстояния (как есть)
+    odo_dist_raw = np.full(n, np.nan)
+    if "odometer" in df.columns and df["odometer"].notna().sum() >= 2:
+        od = df["odometer"].astype(float).to_numpy()
+        d = np.diff(od, prepend=np.nan)
+        # первый сегмент нет значения, отрицательные/слишком большие скачки -> NaN
+        d[0] = np.nan
+        d[d < 0] = np.nan  # сброс одометра
+        odo_dist_raw = d
+
+    # Выбор источника и нормировка одометра (м или км)
+    seg_dist_km = gps_dist.copy()
+    used_source = "gps"
+    if prefer_source in ("odo", "auto") and np.nanmax(odo_dist_raw) > 0 and np.nanmean(odo_dist_raw) > 0:
+        # попытка понять единицы по отношению к GPS (медиана по валидным сегментам)
+        common_mask = (~np.isnan(odo_dist_raw)) & (gps_dist > 0)
+        scale = np.nan
+        if np.any(common_mask):
+            med_odo = float(np.nanmedian(odo_dist_raw[common_mask]))
+            med_gps = float(np.nanmedian(gps_dist[common_mask]))
+            if med_gps > 0:
+                scale = med_odo / med_gps
+        # если похоже на метры (около *1000), делим на 1000
+        if np.isfinite(scale) and 100 <= scale <= 2000:
+            odo_dist_km = odo_dist_raw / 1000.0
+        else:
+            odo_dist_km = odo_dist_raw
+
+        if prefer_source == "odo":
+            seg_dist_km = np.nan_to_num(odo_dist_km, nan=0.0)
+            used_source = "odom"
+        else:  # auto: одометр, если доля валидных сегментов приличная
+            valid_ratio = np.isfinite(odo_dist_km).sum() / max(1, n)
+            if valid_ratio >= 0.5:  # достаточно половины сегментов
+                seg_dist_km = np.nan_to_num(odo_dist_km, nan=0.0)
+                used_source = "odom"
+            else:
+                seg_dist_km = gps_dist
+                used_source = "gps"
+    elif prefer_source == "gps":
+        seg_dist_km = gps_dist
+        used_source = "gps"
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed_kmh = np.where(seg_dt_h > 0, seg_dist_km / seg_dt_h, np.nan)
+
     df["seg_dist_km"] = seg_dist_km
     df["seg_dt_h"] = seg_dt_h
-    with np.errstate(divide="ignore", invalid="ignore"):
-        df["speed_kmh"] = np.where(seg_dt_h > 0, seg_dist_km / seg_dt_h, np.nan)
+    df["speed_kmh"] = speed_kmh
+    df["cum_km"] = np.cumsum(seg_dist_km)
+    df["seg_dt_s"] = (seg_dt_h * 3600).round().astype("int64")
+
     total_km = float(np.nansum(seg_dist_km))
     duration_h = float(np.nansum(seg_dt_h)) if np.isfinite(np.nansum(seg_dt_h)) else np.nan
     avg_speed = float(total_km / duration_h) if duration_h and duration_h > 0 else np.nan
-    max_speed = float(np.nanmax(df["speed_kmh"])) if np.isfinite(np.nanmax(df["speed_kmh"])) else np.nan
+    max_speed = float(np.nanmax(speed_kmh)) if np.isfinite(np.nanmax(speed_kmh)) else np.nan
+
     elev_gain = elev_loss = np.nan
     if df["elevation"].notna().any():
         de = np.diff(df["elevation"].astype(float).to_numpy())
         elev_gain = float(np.sum(de[de > 0])) if de.size else np.nan
         elev_loss = float(-np.sum(de[de < 0])) if de.size else np.nan
+
     return {
         "points": int(n),
         "total_km": total_km,
@@ -170,6 +245,7 @@ def compute_metrics(df: pd.DataFrame):
         "max_speed_kmh": max_speed,
         "elev_gain": elev_gain,
         "elev_loss": elev_loss,
+        "used_source": used_source,
     }, df
 
 def to_geojson_points(df: pd.DataFrame) -> dict:
@@ -191,11 +267,18 @@ st.title("🗺️ Маршрут по точкам — OpenStreetMap (нумер
 with st.sidebar:
     st.header("Файл")
     file = st.file_uploader("Загрузите CSV/GPX/GeoJSON", type=["csv","gpx","geojson","json"])
+    st.header("Опции")
+    dist_source = st.radio(
+        "Источник расстояния",
+        ["Авто", "GPS", "Одометр"],
+        index=0,
+        help="Авто: берём одометр, если он полон, иначе вычисляем по GPS (haversine)."
+    )
     animate = st.checkbox("Анимация линии (AntPath)", True)
     time_slider = st.checkbox("Тайм-слайдер (если есть время)", True)
 
 if not file:
-    st.info("Для CSV колонка **latlng** автоматически разбивается на **lat, lon**. Все точки будут пронумерованы.")
+    st.info("Для CSV колонка **latlng** автоматически разбивается на **lat, lon**. Все точки будут пронумерованы. Также считаются **время, километраж и скорость** (если есть timestamp).")
     st.stop()
 
 with st.spinner("Разбор файла…"):
@@ -215,7 +298,8 @@ with st.spinner("Разбор файла…"):
         st.error("Недостаточно точек.")
         st.stop()
 
-    metrics, df = compute_metrics(df)
+    prefer = {"Авто":"auto","GPS":"gps","Одометр":"odo"}[dist_source]
+    metrics, df = compute_metrics(df, prefer_source=prefer)
 
 # Карта (только OpenStreetMap)
 center = [float(df["lat"].mean()), float(df["lon"].mean())]
@@ -232,13 +316,27 @@ PolyLineTextPath(
 ).add_to(m)
 
 # Нумерация: яркие круглые бейджи с номером
-def numbered_marker(lat, lon, num, color_bg="#1e90ff"):
-    # для 1 и N — свои цвета
+def numbered_marker(lat, lon, num, is_last=False, color_bg="#1e90ff"):
     if num == 1:
         color_bg = "#2ecc71"  # старт: зелёный
+    if is_last:
+        color_bg = "#e74c3c"  # финиш: красный
+    ts = df.at[num-1, "timestamp"]
+    tip_time = f" • {pd.to_datetime(ts).isoformat()}" if pd.notna(ts) else ""
+    seg_d = df.at[num-1, "seg_dist_km"] if num-1 >= 0 else np.nan
+    seg_v = df.at[num-1, "speed_kmh"] if num-1 >= 0 else np.nan
+    cum_d = df.at[num-1, "cum_km"] if num-1 >= 0 else np.nan
+    tooltip = f"#{num}{tip_time}"
+    if np.isfinite(seg_d):
+        tooltip += f" • Δ {seg_d:.3f} км"
+    if np.isfinite(seg_v):
+        tooltip += f" • v {seg_v:.1f} км/ч"
+    if np.isfinite(cum_d):
+        tooltip += f" • Σ {cum_d:.3f} км"
+
     html = f"""
     <div style="
-        background:{'#e74c3c' if num_label_is_last else color_bg};
+        background:{color_bg};
         color:#fff;
         border:2px solid #000;
         border-radius:50%;
@@ -252,19 +350,15 @@ def numbered_marker(lat, lon, num, color_bg="#1e90ff"):
     """
     return folium.Marker(
         [lat, lon],
-        icon=folium.DivIcon(
-            html=html,
-            icon_size=(26,26),
-            icon_anchor=(13,13)
-        ),
-        tooltip=f"#{num}" + (f" • {pd.to_datetime(df.at[num-1,'timestamp']).isoformat()}" if pd.notna(df.at[num-1,'timestamp']) else "")
+        icon=folium.DivIcon(html=html, icon_size=(26,26), icon_anchor=(13,13)),
+        tooltip=tooltip
     )
 
 # Добавляем все пронумерованные точки
 N = len(coords)
 for i, (lat, lon) in enumerate(coords, start=1):
-    num_label_is_last = (i == N)
-    numbered_marker(lat, lon, i).add_to(m)
+    is_last = (i == N)
+    numbered_marker(lat, lon, i, is_last=is_last).add_to(m)
 
 # Отдельно пометки старт/финиш (иконки + подсказки)
 folium.Marker(coords[0], tooltip="Старт (№1)", icon=folium.Icon(color="green")).add_to(m)
@@ -287,5 +381,22 @@ if time_slider and df["timestamp"].notna().any():
 
 st_folium(m, width=1350, height=800, returned_objects=[])
 
-with st.expander("Первые строки очищенных данных"):
-    st.dataframe(df.head(50))
+# ---- Итоги
+st.subheader("Итоги")
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Километраж", f"{metrics['total_km']:.3f} км")
+col2.metric("Время", _format_hms(metrics["duration_h"]))
+col3.metric("Средняя скорость", f"{metrics['avg_speed_kmh']:.1f} км/ч" if np.isfinite(metrics["avg_speed_kmh"]) else "—")
+col4.metric("Макс. скорость", f"{metrics['max_speed_kmh']:.1f} км/ч" if np.isfinite(metrics["max_speed_kmh"]) else "—")
+col5.metric("Источник расстояния", "Одометр" if metrics["used_source"]=="odom" else "GPS")
+
+if not df["timestamp"].notna().any():
+    st.warning("Во входных данных нет корректного времени — длительность и скорость посегментно не вычисляются.")
+
+with st.expander("Первые строки очищенных данных и метрик (до 50)"):
+    show_cols = ["timestamp","lat","lon","elevation","odometer","seg_dist_km","seg_dt_s","speed_kmh","cum_km"]
+    st.dataframe(df[show_cols].head(50))
+
+# Скачать результат
+csv_out = df.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Скачать обогащённый CSV", data=csv_out, file_name="track_with_metrics.csv", mime="text/csv")
